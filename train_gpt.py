@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from typing import Dict
 
 import gpt
 
@@ -29,41 +30,43 @@ st_time = time.time()
 #######################################################################################
 INPUT_FL = "input.txt"
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
-DEVICE = "mps"
+DEVICE = "cuda:0"
 print(f"Running on device: {DEVICE}")
-RUN_ID = f'transformer_{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
-
+RUN_ID = f'sml_transformer_{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
+# Set this to the path to load
+# "logging/checkpoints/sml_transformer_2023-02-05_21:14:50/8000.pt"
+LOAD_MODEL_CKPT_PATH = None 
 
 @dataclass(frozen=True)
 class TrainConfig:
 
     train_frac: float = 0.9
-    batch_sz: int = 32
-    max_iters: int = 1000
+    batch_sz: int = 64
+    max_iters: int = 4_001
     save_every: int = 2000
     checkpoint_folder: str = f"logging/checkpoints/{RUN_ID}/"
-    eval_sz: int = 3000
-    eval_freq: int = 500
+    eval_sz: int = 1000
+    eval_freq: int = 100
     nproc_workers: int = 0
 
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    block_sz: int = 8
+    block_sz: int = 128
     # if you update this also update mlp_hidden_dim
-    embed_dim: int = 32
+    embed_dim: int = 64
     # embed_dim * 4
-    mlp_hidden_dim: int = 32 * 4
+    mlp_hidden_dim: int = 64 * 4
     num_attn_heads: int = 4
     mlp_hidden_layers: int = 1
-    dropout_frac: float = 0.0
+    dropout_frac: float = 0.1
     # number of decoder transformer blocks stacked one on top of another
-    num_blocks: int = 1
+    num_blocks: int = 2
 
 
 @dataclass(frozen=True)
 class OptimizerConfig:
-    learning_rate: float = 1e-3
+    learning_rate: float = 3e-4
 
 
 @dataclass(frozen=True)
@@ -107,14 +110,14 @@ def setup_logging():
 #######################################################################################
 
 
-def txt_to_data(input_txt, ctoix, block_size):
+def txt_to_data(input_txt, ctoix, block_size, device):
     Xs, Ys = [], []
     input_len = len(input_txt)
     input_ixes = encode(txt=input_txt, ctoix=ctoix)
     for i in range(0, input_len - block_size, block_size):
         Xs.append(input_ixes[i : i + block_size])
         Ys.append(input_ixes[i + 1 : i + block_size + 1])
-    return torch.tensor(Xs), torch.tensor(Ys)
+    return torch.tensor(Xs).to(device), torch.tensor(Ys).to(device)
 
 
 def encode(txt, ctoix):
@@ -154,7 +157,9 @@ def split_data(X, Y, train_frac=0.8, to_shuffle=True):
 
 def train_model(
     model,
-    dataloader,
+    # dataloader,
+    Xtrain,
+    Ytrain,
     num_iters,
     optimizer,
     eval_loss_fn,
@@ -162,18 +167,22 @@ def train_model(
     save_every,
     device,
     tb_writer,
-    losses: dict[str, list],  # train -> [], val -> []
+    batch_sz,
+    losses: Dict[str, list],  # train -> [], val -> []
     loss_calc_freq=100,
 ):
     prev_val_loss = 1e5
-    iters = zip(range(num_iters), dataloader)
+    iters = zip(
+        range(num_iters),
+        iter_dataset(Xs=Xtrain, Ys=Ytrain, batch_sz=batch_sz, num=num_iters),
+    )
     for i, (Xi, Yi) in (pbar := tqdm(iters, total=num_iters)):
         loss = eval_model_loss(model=model, X=Xi.to(device), Ytrue=Yi.to(device))
         model.zero_grad()
         loss.backward()
         optimizer.step()
         # Metric tracking
-        if i % loss_calc_freq == 0:
+        if i== num_iters-1 or i % loss_calc_freq == 0:
             eval_losses = eval_loss_fn(model=model)
             tb_writer.add_scalars(
                 main_tag="loss", tag_scalar_dict=eval_losses, global_step=i
@@ -183,7 +192,7 @@ def train_model(
                 losses[split].append(loss)
                 loss_msg += f"{split} loss: {loss:.4f} "
             pbar.set_description(loss_msg)
-            if i % save_every == 0 and eval_losses["val"] < prev_val_loss:
+            if (i == num_iters-1 or i % save_every == 0) and eval_losses["val"] < prev_val_loss:
                 _checkpoint(model=model, checkpoint_folder=checkpoint_folder, it=i)
             prev_val_loss = eval_losses["val"]
 
@@ -258,10 +267,12 @@ def load_input_file(input_fl):
 #######################################################################################
 #  Preparing dataset and building model utilities
 #######################################################################################
-def build_train_matrices(input_txt, ctoix, block_size, train_frac):
+def build_train_matrices(input_txt, ctoix, block_size, train_frac, device):
     # Build training data
     print("Building training data matrices")
-    X, Y = txt_to_data(input_txt=input_txt, ctoix=ctoix, block_size=block_size)
+    X, Y = txt_to_data(
+        input_txt=input_txt, ctoix=ctoix, block_size=block_size, device=device
+    )
     print(f"{X.shape=}, {Y.shape=}")
     # Train validation split
     # we don't want any test data
@@ -308,7 +319,12 @@ def build_model(vocab_sz, transformer_cfg, device):
 #######################################################################################
 
 
-def main(input_fl=INPUT_FL, device=DEVICE, hyperparams=HYPERPARAMS):
+def main(
+    input_fl=INPUT_FL,
+    device=DEVICE,
+    hyperparams=HYPERPARAMS,
+    load_model_ckpt_path=LOAD_MODEL_CKPT_PATH,
+):
     torch.manual_seed(1338)
     tb_writer = setup_logging()
     input_txt, vocab_sz, ctoix, ixtoc = load_input_file(input_fl=input_fl)
@@ -318,19 +334,22 @@ def main(input_fl=INPUT_FL, device=DEVICE, hyperparams=HYPERPARAMS):
         ctoix=ctoix,
         block_size=transformer_cfg.block_sz,
         train_frac=train_cfg.train_frac,
+        device=device,
     )
     Xtrain, Ytrain = data_splits["train"]
-    dataloader = build_dataloader(
-        Xtrain=Xtrain,
-        Ytrain=Ytrain,
-        batch_sz=train_cfg.batch_sz,
-        num_workers=train_cfg.nproc_workers,
-    )
+    # dataloader = build_dataloader(
+    #     Xtrain=Xtrain,
+    #     Ytrain=Ytrain,
+    #     batch_sz=train_cfg.batch_sz,
+    #     num_workers=train_cfg.nproc_workers,
+    # )
     model = build_model(
         vocab_sz=vocab_sz,
         transformer_cfg=transformer_cfg,
         device=device,
     )
+    if load_model_ckpt_path is not None:
+        model.load_state_dict(torch.load(load_model_ckpt_path))
     tb_writer.add_graph(model, Xtrain[:4].to(device))
     print("\nExamples before training the model")
     gpt.print_examples(
@@ -348,7 +367,9 @@ def main(input_fl=INPUT_FL, device=DEVICE, hyperparams=HYPERPARAMS):
     print("Training the transformer model")
     train_model(
         model=model,
-        dataloader=dataloader,
+        Xtrain=Xtrain,
+        Ytrain=Ytrain,
+        # dataloader=dataloader,
         num_iters=train_cfg.max_iters,
         optimizer=optimiser,
         loss_calc_freq=train_cfg.eval_freq,
@@ -360,6 +381,7 @@ def main(input_fl=INPUT_FL, device=DEVICE, hyperparams=HYPERPARAMS):
         checkpoint_folder=train_cfg.checkpoint_folder,
         device=device,
         tb_writer=tb_writer,
+        batch_sz=train_cfg.batch_sz,
     )
     print("\n\nExamples after training the model")
     gpt.print_examples(
