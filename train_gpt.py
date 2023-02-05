@@ -1,22 +1,24 @@
-
+import os
+import os.path
+import sys
 import logging
 import datetime
 import functools as ft
-import matplotlib.pyplot as plt
 import random
 import time
 import torch
-import torch._dynamo.config
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 import torch.utils.tensorboard as tb
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 
 import gpt
 
 from dataclasses import dataclass, field, is_dataclass
 from tqdm import tqdm
-
 
 
 st_time = time.time()
@@ -26,11 +28,10 @@ st_time = time.time()
 # Constants
 #######################################################################################
 INPUT_FL = "input.txt"
-EVAL_FREQ = 500
-EVAL_SZ = 3000
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
-DEVICE = "cpu"
+DEVICE = "mps"
 print(f"Running on device: {DEVICE}")
+RUN_ID = f'transformer_{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,11 @@ class TrainConfig:
     train_frac: float = 0.9
     batch_sz: int = 32
     max_iters: int = 1000
+    save_every: int = 2000
+    checkpoint_folder: str = f"logging/checkpoints/{RUN_ID}/"
+    eval_sz: int = 3000
+    eval_freq: int = 500
+    nproc_workers: int = 0
 
 
 @dataclass(frozen=True)
@@ -67,37 +73,33 @@ class HyperParams:
     train_cfg: TrainConfig
 
 
-def dataclass_to_dict(dc) -> dict:
-    out = {}
-    for k, v in dc.__dict__.items():
-        out[k] = dataclass_to_dict(dc=v) if is_dataclass(v) else v
-    return out
-
-
 HYPERPARAMS = HyperParams(
     train_cfg=TrainConfig(),
     optimizer_cfg=OptimizerConfig(),
     transformer_cfg=TransformerConfig(),
 )
 
-
 #######################################################################################
 # SETUP
 #######################################################################################
-# logging setup
-run_name = f'transformer_{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
-tb_writer = tb.SummaryWriter(log_dir=f"logging/tb/{run_name}")
-logging.basicConfig(
-    filename=f"logging/logs/{run_name}.log",
-    filemode="a",
-    format="%(asctime)s %(name)s %(levelname)s::\t %(message)s",
-    datefmt="%H:%M:%S",
-    level=logging.DEBUG,
-)
-logging.debug(f"{HYPERPARAMS}")
 
 
-torch.manual_seed(1338)
+def setup_logging():
+    # logging setup
+    for folder in ("logs", "tb", "checkpoints"):
+        os.makedirs(f"logging/{folder}/{RUN_ID}/")
+
+    tb_writer = tb.SummaryWriter(log_dir=f"logging/tb/{RUN_ID}")
+    logging.basicConfig(
+        filename=f"logging/logs/{RUN_ID}.log",
+        filemode="a",
+        format="%(asctime)s %(name)s %(levelname)s::\t %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.DEBUG,
+    )
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    logging.info(f"{HYPERPARAMS}")
+    return tb_writer
 
 
 #######################################################################################
@@ -152,16 +154,21 @@ def split_data(X, Y, train_frac=0.8, to_shuffle=True):
 
 def train_model(
     model,
-    dataset_loader,
+    dataloader,
     num_iters,
     optimizer,
     eval_loss_fn,
+    checkpoint_folder,
+    save_every,
+    device,
+    tb_writer,
     losses: dict[str, list],  # train -> [], val -> []
     loss_calc_freq=100,
 ):
-    iters = zip(range(num_iters), dataset_loader)
+    prev_val_loss = 1e5
+    iters = zip(range(num_iters), dataloader)
     for i, (Xi, Yi) in (pbar := tqdm(iters, total=num_iters)):
-        loss = eval_model_loss(model=model, X=Xi.to(DEVICE), Ytrue=Yi.to(DEVICE))
+        loss = eval_model_loss(model=model, X=Xi.to(device), Ytrue=Yi.to(device))
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -176,10 +183,21 @@ def train_model(
                 losses[split].append(loss)
                 loss_msg += f"{split} loss: {loss:.4f} "
             pbar.set_description(loss_msg)
+            if i % save_every == 0 and eval_losses["val"] < prev_val_loss:
+                _checkpoint(model=model, checkpoint_folder=checkpoint_folder, it=i)
+            prev_val_loss = eval_losses["val"]
+
+
+def _checkpoint(model, checkpoint_folder, it):
+    fl = os.path.join(checkpoint_folder, f"{it}.pt")
+    msg = f"Iteration {it}: Checkpointing model at {fl}"
+    print(msg)
+    logging.info(msg)
+    torch.save(model.state_dict(), f=fl)
 
 
 @torch.no_grad()
-def eval_loss(model, data_splits, eval_sz):
+def eval_loss(model, data_splits, eval_sz, device):
     model.eval()
     out = {}
     for split in ["train", "val"]:
@@ -187,7 +205,7 @@ def eval_loss(model, data_splits, eval_sz):
         Xbatch, Ybatch = next(iter_dataset(Xs=X, Ys=Y, batch_sz=eval_sz))
         # fwd, loss = model(X, target)
         out[split] = eval_model_loss(
-            model=model, X=Xbatch.to(DEVICE), Ytrue=Ybatch.to(DEVICE)
+            model=model, X=Xbatch.to(device), Ytrue=Ybatch.to(device)
         ).item()
     model.train()
     return out
@@ -222,97 +240,140 @@ def calc_split_loss(model, data_splits, split):
 #######################################################################################
 # Load data
 #######################################################################################
-with open(INPUT_FL, encoding="utf-8") as infile:
-    input_txt = infile.read()
-vocab = sorted(set(input_txt))
-vocab_sz = len(vocab)
-ctoix = {char: ix for ix, char in enumerate(vocab)}
-ixtoc = {ix: char for ix, char in enumerate(vocab)}
-print("Vocab:", vocab)
-print(f"Num characters: {len(input_txt):,}\nExample text:")
-print()
-print(input_txt[:1000])
-print("-----------------------------------------------------------")
+def load_input_file(input_fl):
+    with open(input_fl, encoding="utf-8") as infile:
+        input_txt = infile.read()
+    vocab = sorted(set(input_txt))
+    vocab_sz = len(vocab)
+    ctoix = {char: ix for ix, char in enumerate(vocab)}
+    ixtoc = {ix: char for ix, char in enumerate(vocab)}
+    print("Vocab:", vocab)
+    print(f"Num characters: {len(input_txt):,}\nExample text:")
+    print()
+    print(input_txt[:1000])
+    print("-----------------------------------------------------------")
+    return input_txt, vocab_sz, ctoix, ixtoc
+
 
 #######################################################################################
-#  Train models
+#  Preparing dataset and building model utilities
 #######################################################################################
-# Build training data
-print("Building training data matrices")
-X, Y = txt_to_data(
-    input_txt=input_txt, ctoix=ctoix, block_size=HYPERPARAMS.transformer_cfg.block_sz
-)
-print(f"{X.shape=}, {Y.shape=}")
-# Train validation split
-# we don't want any test data
-print("Splitting into train, validation")
-data_splits = split_data(
-    X=X, Y=Y, train_frac=HYPERPARAMS.train_cfg.train_frac, to_shuffle=False
-)
+def build_train_matrices(input_txt, ctoix, block_size, train_frac):
+    # Build training data
+    print("Building training data matrices")
+    X, Y = txt_to_data(input_txt=input_txt, ctoix=ctoix, block_size=block_size)
+    print(f"{X.shape=}, {Y.shape=}")
+    # Train validation split
+    # we don't want any test data
+    print("Splitting into train, validation")
+    data_splits = split_data(X=X, Y=Y, train_frac=train_frac, to_shuffle=False)
+    Xtrain, Ytrain = data_splits["train"]
+    Xval, Yval = data_splits["val"]
+    print(f"{Xtrain.shape=}, {Ytrain.shape=}")
+    print(f"{Xval.shape=}, {Yval.shape=}")
+    return data_splits
 
-train_nll = ft.partial(calc_split_loss, data_splits=data_splits, split="train")
-val_nll = ft.partial(calc_split_loss, data_splits=data_splits, split="val")
-eval_loss_fn = ft.partial(eval_loss, data_splits=data_splits, eval_sz=EVAL_SZ)
 
-Xtrain, Ytrain = data_splits["train"]
-Xval, Yval = data_splits["val"]
-print(f"{Xtrain.shape=}, {Ytrain.shape=}")
-print(f"{Xval.shape=}, {Yval.shape=}")
-train_dataset = torch.utils.data.TensorDataset(Xtrain, Ytrain)
-dataset_loader = torch.utils.data.DataLoader(
-    dataset=train_dataset,
-    batch_size=HYPERPARAMS.train_cfg.batch_sz,
-    shuffle=True,
-    num_workers=0,
-)
-# Define the model
-print("Creating the transformer model")
-model = gpt.Transformer(
-    embed_dim=HYPERPARAMS.transformer_cfg.embed_dim,
-    vocab_sz=vocab_sz,
-    block_size=HYPERPARAMS.transformer_cfg.block_sz,
-    num_attn_head=HYPERPARAMS.transformer_cfg.num_attn_heads,
-    mlp_hidden_dim=HYPERPARAMS.transformer_cfg.mlp_hidden_dim,
-    mlp_hidden_layers=HYPERPARAMS.transformer_cfg.mlp_hidden_layers,
-    dropout_frac=HYPERPARAMS.transformer_cfg.dropout_frac,
-    num_blocks=HYPERPARAMS.transformer_cfg.num_blocks,
-    device=DEVICE,
-).to(DEVICE)
-# model = torch.compile(model=model)
-tb_writer.add_graph(model, Xtrain[:4].to(DEVICE))
-print("\nExamples before training the model")
-gpt.print_examples(
-    model=model,
-    max_len=1000,
-    block_size=HYPERPARAMS.transformer_cfg.block_sz,
-    ixtoc=ixtoc,
-    device=DEVICE,
-    num_examples=2,
-)
-optimiser = torch.optim.AdamW(
-    params=model.parameters(), lr=HYPERPARAMS.optimizer_cfg.learning_rate
-)
-losses = {"train": [], "val": []}
-# Train the model
-print("Training the transformer model")
-train_model(
-    model=model,
-    dataset_loader=dataset_loader,
-    num_iters=HYPERPARAMS.train_cfg.max_iters,
-    optimizer=optimiser,
-    loss_calc_freq=EVAL_FREQ,
-    losses=losses,
-    eval_loss_fn=eval_loss_fn,
-)
-print("\n\nExamples after training the model")
-gpt.print_examples(
-    model=model,
-    max_len=1000,
-    block_size=HYPERPARAMS.transformer_cfg.block_sz,
-    device=DEVICE,
-    ixtoc=ixtoc,
-    num_examples=2,
-)
-el_time = time.time() - st_time
-print(f"Time elapsed: {el_time:,}s {el_time//60:,}m")
-tb_writer.close()
+def build_dataloader(Xtrain, Ytrain, batch_sz, num_workers):
+    train_dataset = torch.utils.data.TensorDataset(Xtrain, Ytrain)
+    return torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_sz,
+        num_workers=num_workers,
+        pin_memory=True,
+        # sampler=DistributedSampler(train_dataset),
+    )
+
+
+def build_model(vocab_sz, transformer_cfg, device):
+    # Define the model
+    print("Creating the transformer model")
+    model = gpt.Transformer(
+        embed_dim=transformer_cfg.embed_dim,
+        vocab_sz=vocab_sz,
+        block_size=transformer_cfg.block_sz,
+        num_attn_head=transformer_cfg.num_attn_heads,
+        mlp_hidden_dim=transformer_cfg.mlp_hidden_dim,
+        mlp_hidden_layers=transformer_cfg.mlp_hidden_layers,
+        dropout_frac=transformer_cfg.dropout_frac,
+        num_blocks=transformer_cfg.num_blocks,
+        device=device,
+    ).to(device)
+    # model = torch.compile(model=model)
+    return model
+
+
+#######################################################################################
+#  Main logic function
+#######################################################################################
+
+
+def main(input_fl=INPUT_FL, device=DEVICE, hyperparams=HYPERPARAMS):
+    torch.manual_seed(1338)
+    tb_writer = setup_logging()
+    input_txt, vocab_sz, ctoix, ixtoc = load_input_file(input_fl=input_fl)
+    train_cfg, transformer_cfg = hyperparams.train_cfg, hyperparams.transformer_cfg
+    data_splits = build_train_matrices(
+        input_txt=input_txt,
+        ctoix=ctoix,
+        block_size=transformer_cfg.block_sz,
+        train_frac=train_cfg.train_frac,
+    )
+    Xtrain, Ytrain = data_splits["train"]
+    dataloader = build_dataloader(
+        Xtrain=Xtrain,
+        Ytrain=Ytrain,
+        batch_sz=train_cfg.batch_sz,
+        num_workers=train_cfg.nproc_workers,
+    )
+    model = build_model(
+        vocab_sz=vocab_sz,
+        transformer_cfg=transformer_cfg,
+        device=device,
+    )
+    tb_writer.add_graph(model, Xtrain[:4].to(device))
+    print("\nExamples before training the model")
+    gpt.print_examples(
+        model=model,
+        max_len=1000,
+        block_size=transformer_cfg.block_sz,
+        ixtoc=ixtoc,
+        device=device,
+        num_examples=2,
+    )
+    optimiser = torch.optim.AdamW(
+        params=model.parameters(), lr=hyperparams.optimizer_cfg.learning_rate
+    )
+    # Train the model
+    print("Training the transformer model")
+    train_model(
+        model=model,
+        dataloader=dataloader,
+        num_iters=train_cfg.max_iters,
+        optimizer=optimiser,
+        loss_calc_freq=train_cfg.eval_freq,
+        losses={"train": [], "val": []},  # not used, see tensorboard instead
+        eval_loss_fn=ft.partial(
+            eval_loss, data_splits=data_splits, eval_sz=train_cfg.eval_sz, device=device
+        ),
+        save_every=train_cfg.save_every,
+        checkpoint_folder=train_cfg.checkpoint_folder,
+        device=device,
+        tb_writer=tb_writer,
+    )
+    print("\n\nExamples after training the model")
+    gpt.print_examples(
+        model=model,
+        max_len=1000,
+        block_size=transformer_cfg.block_sz,
+        device=device,
+        ixtoc=ixtoc,
+        num_examples=2,
+    )
+    el_time = time.time() - st_time
+    print(f"Time elapsed: {el_time:,}s {el_time//60:,}m")
+    tb_writer.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -4,7 +4,6 @@ Some constants:
 B: Batch dim, T - time dimension (here max of block size), C - channel or embed dim
 """
 import torch
-import torch._dynamo.config
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
