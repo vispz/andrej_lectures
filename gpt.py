@@ -6,9 +6,9 @@ B: Batch dim, T - time dimension (here max of block size), C - channel or embed 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data
 
-from dataclasses import dataclass, field, is_dataclass
+from tqdm import tqdm
+from dataclasses import dataclass
 
 
 @dataclass(eq=False)
@@ -104,22 +104,16 @@ class MLP(nn.Module):
 
     embed_dim: int
     hidden_dim: int
-    nlayers: int
     dropout_frac: float
 
     def __post_init__(self):
         super().__init__()
-        embed_dim, hidden_dim = self.embed_dim, self.hidden_dim
-        first_layer = [
-            nn.Linear(embed_dim, hidden_dim),
+        self.sequential = nn.Sequential(
+            nn.Linear(self.embed_dim, self.hidden_dim),
             nn.ReLU(),
-        ]
-        hidden_layers = []
-        for _ in range(self.nlayers - 1):
-            hidden_layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
-        last_layer = [nn.Linear(hidden_dim, embed_dim), nn.Dropout(self.dropout_frac)]
-        layers = first_layer + hidden_layers + last_layer
-        self.sequential = nn.Sequential(*layers)
+            nn.Linear(self.hidden_dim, self.embed_dim),
+            nn.Dropout(self.dropout_frac),
+        )
 
     def forward(self, X):
         return self.sequential(X)
@@ -131,7 +125,6 @@ class Block(nn.Module):
     embed_dim: int
     block_size: int
     num_attn_head: int
-    mlp_hidden_layers: int
     mlp_hidden_dim: int
     dropout_frac: float
 
@@ -147,7 +140,6 @@ class Block(nn.Module):
         self.mlp = MLP(
             embed_dim=self.embed_dim,
             hidden_dim=self.mlp_hidden_dim,
-            nlayers=self.mlp_hidden_dim,
             dropout_frac=self.dropout_frac,
         )
         self.ln2 = nn.LayerNorm(normalized_shape=self.embed_dim)
@@ -165,7 +157,6 @@ class Transformer(nn.Module):
     embed_dim: int
     block_size: int
     num_attn_head: int
-    mlp_hidden_layers: int
     mlp_hidden_dim: int
     num_blocks: int
     dropout_frac: float
@@ -186,7 +177,6 @@ class Transformer(nn.Module):
             block_size=block_size,
             num_attn_head=self.num_attn_head,
             mlp_hidden_dim=self.mlp_hidden_dim,
-            mlp_hidden_layers=self.mlp_hidden_layers,
             dropout_frac=self.dropout_frac,
         )
         self.blocks = nn.Sequential(
@@ -229,7 +219,7 @@ def gen_examples(
     cur_block = torch.zeros(num_examples, block_size, dtype=torch.int, device=device)
     # This will be appended with the next prediction continuously
     outputs = torch.zeros(num_examples, 1, dtype=torch.int, device=device)
-    for _ in range(max_len):
+    for _ in tqdm(range(max_len)):
         # B x C
         logits = model(cur_block)
         # B x C: we only look at the last time step to sample the next token
