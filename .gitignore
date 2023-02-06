@@ -1,2 +1,7 @@
 .ipynb_checkpoints/**
 experiment*/**
+logging/**
+data/**
+__pycache__/**
+.DS_Store/**
+input.txt
