@@ -214,6 +214,7 @@ def gen_examples(
     Logic: We always take the prediction of the last time dim, in the block. We add
     the
     """
+    model.eval()
     # B x T: zero corresponds to the newline character
     # This always contains the current block size of context
     cur_block = torch.zeros(num_examples, block_size, dtype=torch.int, device=device)
@@ -228,6 +229,7 @@ def gen_examples(
         next_ix = torch.multinomial(probas.squeeze(), num_samples=1)
         outputs = torch.concat((outputs, next_ix), axis=1)  # type: ignore
         cur_block = torch.concat((cur_block[:, 1:], next_ix), axis=1)  # type: ignore
+    model.train()
     return outputs
 
 
