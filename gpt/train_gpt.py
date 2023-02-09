@@ -14,9 +14,12 @@ import functools as ft
 import time
 import torch
 import torch.nn.functional as F
-import torch.utils.data
+import torch.utils.data as data_utils
 import torch.utils.tensorboard as tb
 from typing import Dict
+from typing import Tuple
+
+from torch import nn
 
 import gpt
 
@@ -36,7 +39,7 @@ print(f"Running on device: {DEVICE}")
 RUN_ID = f"{int(time.time())}"
 # Set this to the path to load
 # "logging/checkpoints/sml_transformer_2023-02-06_00_23_38/4500.pt"
-LOAD_MODEL_CKPT_PATH = "logging/checkpoints/final_model/6900.pt"
+LOAD_MODEL_CKPT_PATH = None  # "logging/checkpoints/final_model/6900.pt"
 START_IT = 4800
 
 
@@ -44,7 +47,7 @@ START_IT = 4800
 class TrainConfig:
 
     train_frac: float = 0.9
-    batch_sz: int = 256
+    batch_sz: int = 32
     max_iters: int = 5001
     save_every: int = 300
     checkpoint_folder: str = f"logging/checkpoints/{RUN_ID}/"
@@ -56,15 +59,15 @@ class TrainConfig:
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    block_sz: int = 256
+    block_sz: int = 8
     # if you update this also update mlp_hidden_dim
-    embed_dim: int = 384
+    embed_dim: int = 32
     # embed_dim * 4
-    mlp_hidden_dim: int = 384 * 4
-    num_attn_heads: int = 6
+    mlp_hidden_dim: int = 32 * 4
+    num_attn_heads: int = 2
     dropout_frac: float = 0.2
     # number of decoder transformer blocks stacked one on top of another
-    num_blocks: int = 6
+    num_blocks: int = 1
 
 
 @dataclass(frozen=True)
@@ -93,18 +96,18 @@ def main(
     train_data, val_data, vocab_sz, ixtoc = load_input_file(
         input_fl=input_fl, train_frac=train_cfg.train_frac
     )
-    get_batch_fn = ft.partial(
-        get_batch_helper,
+    train_dl, val_dl = get_dataloaders(
         train_data=train_data,
         val_data=val_data,
         block_sz=transformer_cfg.block_sz,
+        batch_sz=train_cfg.batch_sz,
         device=device,
     )
     model = build_model(
         vocab_sz=vocab_sz, transformer_cfg=transformer_cfg, device=device
     )
     maybe_load_wts_from_ckpt(model=model, load_model_ckpt_path=load_model_ckpt_path)
-    tb_writer.add_graph(model, get_batch_fn(split="train", batch_sz=4)[0])
+    tb_writer.add_graph(model, next(iter(train_dl))[0])
     print("\nExamples before training the model")
     print_example_kwargs = dict(
         model=model,
@@ -123,19 +126,18 @@ def main(
     print("Training the transformer model")
     train_model(
         model=model,
-        get_batch_fn=get_batch_fn,
+        train_dl=train_dl,
         num_iters=train_cfg.max_iters,
         optimizer=optimiser,
         loss_calc_freq=train_cfg.eval_freq,
         losses={"train": [], "val": []},  # not used, see tensorboard instead
         eval_loss_fn=ft.partial(
-            eval_loss, get_batch_fn=get_batch_fn, eval_sz=train_cfg.eval_sz
+            eval_loss, train_dl=train_dl, val_dl=val_dl, eval_sz=train_cfg.eval_sz
         ),
         save_every=train_cfg.save_every,
         checkpoint_folder=train_cfg.checkpoint_folder,
         device=device,
         tb_writer=tb_writer,
-        batch_sz=train_cfg.batch_sz,
     )
     print("\n\nExamples after training the model")
     gpt.print_examples(**print_example_kwargs)  # type: ignore
@@ -181,6 +183,45 @@ def load_input_file(input_fl, train_frac):
 
 def encode(txt, ctoix):
     return [ctoix[char] for char in txt]
+
+
+@dataclass
+class DecoderDataset(data_utils.Dataset):
+
+    block_sz: int
+    device: str
+    data: torch.Tensor
+
+    def __post_init__(self):
+        super().__init__()
+        self.len = len(self.data) - self.block_sz - 1
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, index):
+        i = index
+        x = self.data[i : i + self.block_sz]
+        y = self.data[i + 1 : i + self.block_sz + 1]
+        return x.to(self.device), y.to(self.device)
+
+
+def get_dataloaders(
+    train_data: torch.Tensor,
+    val_data: torch.Tensor,
+    block_sz: int,
+    batch_sz: int,
+    device: str,
+) -> Tuple[data_utils.DataLoader, data_utils.DataLoader]:
+    ds_kwargs = dict(block_sz=block_sz, device=device)
+    dl_kwargs = dict(batch_size=batch_sz, shuffle=False, sampler=None)
+    train_dl = data_utils.DataLoader(
+        dataset=DecoderDataset(data=train_data, **ds_kwargs), **dl_kwargs  # type: ignore
+    )
+    val_dl = data_utils.DataLoader(
+        dataset=DecoderDataset(data=val_data, **ds_kwargs), **dl_kwargs  # type: ignore
+    )
+    return train_dl, val_dl
 
 
 def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
@@ -237,23 +278,21 @@ def maybe_load_wts_from_ckpt(model, load_model_ckpt_path):
 
 
 def train_model(
-    model,
-    get_batch_fn,
-    num_iters,
+    model: nn.Module,
+    train_dl: data_utils.DataLoader,
+    num_iters: int,
     optimizer,
     eval_loss_fn,
     checkpoint_folder,
     save_every,
     device,
     tb_writer,
-    batch_sz,
     losses: Dict[str, list],  # train -> [], val -> []
     loss_calc_freq=100,
 ):
     prev_val_loss = 1e5
-    for i in (pbar := tqdm(range(num_iters))):
-        Xi, Yi = get_batch_fn(split="train", batch_sz=batch_sz)
-        loss = eval_model_loss(model=model, X=Xi.to(device), Ytrue=Yi.to(device))
+    for i, (Xi, Yi) in (pbar := tqdm(zip(range(num_iters), train_dl))):
+        loss = eval_model_loss(model=model, X=Xi, Ytrue=Yi)
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -287,13 +326,23 @@ def _checkpoint(model, checkpoint_folder, it):
 
 
 @torch.no_grad()
-def eval_loss(model, get_batch_fn, eval_sz):
+def eval_loss(model, train_dl, val_dl, eval_sz):
     model.eval()
     out = {}
-    for split in ["train", "val"]:
-        Xbatch, Ybatch = get_batch_fn(split=split, batch_sz=eval_sz)
-        # fwd, loss = model(X, target)
-        out[split] = eval_model_loss(model=model, X=Xbatch, Ytrue=Ybatch).item()
+    # Dataloader issues out x, y of length batch_sz but we want eval_sz. Find the
+    #   number of batch_sz we need and vstack them.
+    # next(train_dl) -> x, y
+    batch_sz = next(iter(train_dl))[0].shape[0]
+    # slightly more than eval sz but 🤷
+    stacks = (eval_sz // batch_sz) + 1
+    for split, dl in [("train", train_dl), ("val", val_dl)]:
+        Xbatches, Ybatches = [], []
+        for _ in range(stacks):
+            Xb, Yb = next(iter(dl))
+            Xbatches.append(Xb)
+            Ybatches.append(Yb)
+        Xeval, Yeval = torch.vstack(Xbatches), torch.vstack(Ybatches)
+        out[split] = eval_model_loss(model=model, X=Xeval, Ytrue=Yeval).item()
     model.train()
     return out
 
