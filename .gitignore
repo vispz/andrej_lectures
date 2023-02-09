@@ -1,6 +1,7 @@
+
 .ipynb_checkpoints/**
 experiment*/**
-logging/**
+**/logging/**
 data/**
 __pycache__/**
 .DS_Store/**
