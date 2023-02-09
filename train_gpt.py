@@ -10,8 +10,6 @@ Usage::
 import os
 import os.path
 import sys
-import logging
-import datetime
 import functools as ft
 import time
 import torch
@@ -28,15 +26,14 @@ from tqdm import tqdm
 
 st_time = time.time()
 
-
 #######################################################################################
 # Constants
 #######################################################################################
 INPUT_FL = "input.txt"
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Running on device: {DEVICE}")
-RUN_ID = f'sml_transformer_{datetime.datetime.now().strftime("%Y-%m-%d_%H_%M_%S")}'
+RUN_ID = f"{int(time.time())}"
 # Set this to the path to load
 # "logging/checkpoints/sml_transformer_2023-02-06_00_23_38/4500.pt"
 LOAD_MODEL_CKPT_PATH = "logging/checkpoints/final_model/6900.pt"
@@ -54,6 +51,7 @@ class TrainConfig:
     eval_sz: int = 2000
     eval_freq: int = 100
     nproc_workers: int = 0
+    learning_rate: float = 3e-4
 
 
 @dataclass(frozen=True)
@@ -70,44 +68,167 @@ class TransformerConfig:
 
 
 @dataclass(frozen=True)
-class OptimizerConfig:
-    learning_rate: float = 3e-4
-
-
-@dataclass(frozen=True)
 class HyperParams:
     transformer_cfg: TransformerConfig
-    optimizer_cfg: OptimizerConfig
     train_cfg: TrainConfig
 
 
-HYPERPARAMS = HyperParams(
-    train_cfg=TrainConfig(),
-    optimizer_cfg=OptimizerConfig(),
-    transformer_cfg=TransformerConfig(),
-)
+HYPERPARAMS = HyperParams(train_cfg=TrainConfig(), transformer_cfg=TransformerConfig())
+
+#######################################################################################
+#  Main logic function
+#######################################################################################
+
+
+def main(
+    is_predict_mode,
+    input_fl=INPUT_FL,
+    device=DEVICE,
+    hyperparams=HYPERPARAMS,
+    load_model_ckpt_path=LOAD_MODEL_CKPT_PATH,
+):
+    torch.manual_seed(1338)
+    tb_writer = setup_tensorboard()
+    train_cfg, transformer_cfg = hyperparams.train_cfg, hyperparams.transformer_cfg
+    train_data, val_data, vocab_sz, ixtoc = load_input_file(
+        input_fl=input_fl, train_frac=train_cfg.train_frac
+    )
+    get_batch_fn = ft.partial(
+        get_batch_helper,
+        train_data=train_data,
+        val_data=val_data,
+        block_sz=transformer_cfg.block_sz,
+        device=device,
+    )
+    model = build_model(
+        vocab_sz=vocab_sz, transformer_cfg=transformer_cfg, device=device
+    )
+    maybe_load_wts_from_ckpt(model=model, load_model_ckpt_path=load_model_ckpt_path)
+    tb_writer.add_graph(model, get_batch_fn(split="train", batch_sz=4)[0])
+    print("\nExamples before training the model")
+    print_example_kwargs = dict(
+        model=model,
+        max_len=10_000 if is_predict_mode else 300,
+        block_size=transformer_cfg.block_sz,
+        ixtoc=ixtoc,
+        device=device,
+        num_examples=2,
+    )
+    gpt.print_examples(**print_example_kwargs)  # type: ignore
+    if is_predict_mode:
+        print("In prediction mode. Exiting!")
+        return
+    optimiser = torch.optim.AdamW(params=model.parameters(), lr=train_cfg.learning_rate)
+    # Train the model
+    print("Training the transformer model")
+    train_model(
+        model=model,
+        get_batch_fn=get_batch_fn,
+        num_iters=train_cfg.max_iters,
+        optimizer=optimiser,
+        loss_calc_freq=train_cfg.eval_freq,
+        losses={"train": [], "val": []},  # not used, see tensorboard instead
+        eval_loss_fn=ft.partial(
+            eval_loss, get_batch_fn=get_batch_fn, eval_sz=train_cfg.eval_sz
+        ),
+        save_every=train_cfg.save_every,
+        checkpoint_folder=train_cfg.checkpoint_folder,
+        device=device,
+        tb_writer=tb_writer,
+        batch_sz=train_cfg.batch_sz,
+    )
+    print("\n\nExamples after training the model")
+    gpt.print_examples(**print_example_kwargs)  # type: ignore
+    el_time = time.time() - st_time
+    print(f"Time elapsed: {el_time:,}s {el_time//60:,}m")
+    tb_writer.close()
+
 
 #######################################################################################
 # SETUP
 #######################################################################################
 
 
-def setup_logging():
+def setup_tensorboard():
     # logging setup
     for folder in ("tb", "checkpoints"):
         os.makedirs(f"logging/{folder}/{RUN_ID}/")
-    os.makedirs(f"logging/logs/", exist_ok=True)
     tb_writer = tb.SummaryWriter(log_dir=f"logging/tb/{RUN_ID}")
-    logging.basicConfig(
-        filename=f"logging/logs/{RUN_ID}.log",
-        filemode="a",
-        format="%(asctime)s %(name)s %(levelname)s::\t %(message)s",
-        datefmt="%H:%M:%S",
-        level=logging.DEBUG,
-    )
-    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-    logging.info(f"{HYPERPARAMS}")
+    print(f"{HYPERPARAMS}")
     return tb_writer
+
+
+#######################################################################################
+# Load data
+#######################################################################################
+def load_input_file(input_fl, train_frac):
+    with open(input_fl, encoding="utf-8") as infile:
+        input_txt = infile.read()
+    vocab = sorted(set(input_txt))
+    vocab_sz = len(vocab)
+    ctoix = {char: ix for ix, char in enumerate(vocab)}
+    ixtoc = {ix: char for ix, char in enumerate(vocab)}
+    print("Vocab:", vocab)
+    print(f"Num characters: {len(input_txt):,}\nExample text:\n")
+    print(input_txt[:1000])
+    print("-----------------------------------------------------------")
+    data = torch.tensor(encode(txt=input_txt, ctoix=ctoix), dtype=torch.long)
+    n = int(train_frac * len(data))  # first 90% will be train, rest val
+    train_data = data[:n]
+    val_data = data[n:]
+    return train_data, val_data, vocab_sz, ixtoc
+
+
+def encode(txt, ctoix):
+    return [ctoix[char] for char in txt]
+
+
+def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
+    # generate a small batch of data of inputs x and targets y
+    data = train_data if split == "train" else val_data
+    ix = torch.randint(len(data) - block_sz, (batch_sz,))
+    x = torch.stack([data[i : i + block_sz] for i in ix])
+    y = torch.stack([data[i + 1 : i + block_sz + 1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+
+#######################################################################################
+# Training loop
+#######################################################################################
+
+
+def build_model(vocab_sz, transformer_cfg, device):
+    # Define the model
+    print("Creating the transformer model")
+    model = gpt.Transformer(
+        embed_dim=transformer_cfg.embed_dim,
+        vocab_sz=vocab_sz,
+        block_size=transformer_cfg.block_sz,
+        num_attn_head=transformer_cfg.num_attn_heads,
+        mlp_hidden_dim=transformer_cfg.mlp_hidden_dim,
+        dropout_frac=transformer_cfg.dropout_frac,
+        num_blocks=transformer_cfg.num_blocks,
+        device=device,
+    ).to(device)
+    # print the model architecture
+    for nm, p in model.named_parameters():
+        print(nm, p.shape)
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+    # model = torch.compile(model=model)
+    return model
+
+
+def maybe_load_wts_from_ckpt(model, load_model_ckpt_path):
+    """Mutates model in-place"""
+    if load_model_ckpt_path is not None:
+        print(f"Loading model from checkpoint: {load_model_ckpt_path}")
+        model.load_state_dict(
+            torch.load(load_model_ckpt_path, map_location=torch.device("cpu"))
+        )
+    else:
+        print("No model checkpoint passed. Training from scratch.")
 
 
 #######################################################################################
@@ -161,7 +282,7 @@ def _checkpoint(model, checkpoint_folder, it):
     fl = os.path.join(checkpoint_folder, f"{it}.pt")
     msg = f"Iteration {it}: Checkpointing model at {fl}"
     print(msg)
-    logging.info(msg)
+    print(msg)
     torch.save(model.state_dict(), f=fl)
 
 
@@ -204,144 +325,12 @@ def calc_split_loss(model, data_splits, split):
 
 
 #######################################################################################
-# Load data
+# Boiler plate main function
 #######################################################################################
-def load_input_file(input_fl, train_frac):
-    with open(input_fl, encoding="utf-8") as infile:
-        input_txt = infile.read()
-    vocab = sorted(set(input_txt))
-    vocab_sz = len(vocab)
-    ctoix = {char: ix for ix, char in enumerate(vocab)}
-    ixtoc = {ix: char for ix, char in enumerate(vocab)}
-    print("Vocab:", vocab)
-    print(f"Num characters: {len(input_txt):,}\nExample text:")
-    print()
-    print(input_txt[:1000])
-    print("-----------------------------------------------------------")
-    data = torch.tensor(encode(txt=input_txt, ctoix=ctoix), dtype=torch.long)
-    n = int(train_frac * len(data))  # first 90% will be train, rest val
-    train_data = data[:n]
-    val_data = data[n:]
-    return train_data, val_data, vocab_sz, ixtoc
-
-
-def encode(txt, ctoix):
-    return [ctoix[char] for char in txt]
-
-
-def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_sz, (batch_sz,))
-    x = torch.stack([data[i : i + block_sz] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_sz + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-
-def build_model(vocab_sz, transformer_cfg, device):
-    # Define the model
-    print("Creating the transformer model")
-    model = gpt.Transformer(
-        embed_dim=transformer_cfg.embed_dim,
-        vocab_sz=vocab_sz,
-        block_size=transformer_cfg.block_sz,
-        num_attn_head=transformer_cfg.num_attn_heads,
-        mlp_hidden_dim=transformer_cfg.mlp_hidden_dim,
-        dropout_frac=transformer_cfg.dropout_frac,
-        num_blocks=transformer_cfg.num_blocks,
-        device=device,
-    ).to(device)
-    # model = torch.compile(model=model)
-    return model
-
-
-#######################################################################################
-#  Main logic function
-#######################################################################################
-
-
-def main(
-    input_fl=INPUT_FL,
-    device=DEVICE,
-    hyperparams=HYPERPARAMS,
-    load_model_ckpt_path=LOAD_MODEL_CKPT_PATH,
-):
-    torch.manual_seed(1338)
-    tb_writer = setup_logging()
-    train_cfg, transformer_cfg = hyperparams.train_cfg, hyperparams.transformer_cfg
-    train_data, val_data, vocab_sz, ixtoc = load_input_file(
-        input_fl=input_fl, train_frac=train_cfg.train_frac
-    )
-    get_batch_fn = ft.partial(
-        get_batch_helper,
-        train_data=train_data,
-        val_data=val_data,
-        block_sz=transformer_cfg.block_sz,
-        device=device,
-    )
-    model = build_model(
-        vocab_sz=vocab_sz,
-        transformer_cfg=transformer_cfg,
-        device=device,
-    )
-    for nm, p in model.named_parameters():
-        print(nm, p.shape)
-    # print the number of parameters in the model
-    print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
-    if load_model_ckpt_path is not None:
-        print(f"Loading model from checkpoint: {load_model_ckpt_path}")
-        model.load_state_dict(torch.load(load_model_ckpt_path, map_location=torch.device('cpu')))
-    else:
-        print("No model checkpoint passed. Training from scratch.")
-    xbatch, _ = get_batch_fn(split="train", batch_sz=4)
-    tb_writer.add_graph(model, xbatch)
-    print("\nExamples before training the model")
-    gpt.print_examples(
-        model=model,
-        max_len=1000,
-        block_size=transformer_cfg.block_sz,
-        ixtoc=ixtoc,
-        device=device,
-        num_examples=2,
-    )
-    if sys.argv[1].startswith("predict"):
-        "In prediction mode. Exiting!"
-        return 
-    optimiser = torch.optim.AdamW(
-        params=model.parameters(), lr=hyperparams.optimizer_cfg.learning_rate
-    )
-    # Train the model
-    print("Training the transformer model")
-    train_model(
-        model=model,
-        get_batch_fn=get_batch_fn,
-        num_iters=train_cfg.max_iters,
-        optimizer=optimiser,
-        loss_calc_freq=train_cfg.eval_freq,
-        losses={"train": [], "val": []},  # not used, see tensorboard instead
-        eval_loss_fn=ft.partial(
-            eval_loss, get_batch_fn=get_batch_fn, eval_sz=train_cfg.eval_sz
-        ),
-        save_every=train_cfg.save_every,
-        checkpoint_folder=train_cfg.checkpoint_folder,
-        device=device,
-        tb_writer=tb_writer,
-        batch_sz=train_cfg.batch_sz,
-    )
-    print("\n\nExamples after training the model")
-    gpt.print_examples(
-        model=model,
-        max_len=1000,
-        block_size=transformer_cfg.block_sz,
-        device=device,
-        ixtoc=ixtoc,
-        num_examples=2,
-    )
-    el_time = time.time() - st_time
-    print(f"Time elapsed: {el_time:,}s {el_time//60:,}m")
-    tb_writer.close()
-
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        is_predict_mode = sys.argv[1].startswith("predict")
+    else:
+        is_predict_mode = False
+    main(is_predict_mode=is_predict_mode)
