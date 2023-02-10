@@ -63,7 +63,6 @@ START_IT = 6000
 
 @dataclass(frozen=True)
 class TrainConfig:
-
     batch_sz: int
     save_every: int
     learning_rate: float
