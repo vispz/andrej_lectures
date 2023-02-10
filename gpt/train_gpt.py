@@ -11,6 +11,7 @@ import os
 import os.path
 import sys
 import functools as ft
+import itertools
 import time
 import torch
 import torch.nn.functional as F
@@ -47,17 +48,17 @@ st_time = time.time()
 #######################################################################################
 # Constants
 #######################################################################################
-USE_MULTIGPU = False
+USE_MULTIGPU = True
 
 INPUT_FL = "input.txt"
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Running on device: {DEVICE}")
 RUN_ID = f"{int(time.time())}"
-# Set this to the path to load
-# "logging/checkpoints/sml_transformer_2023-02-06_00_23_38/4500.pt"
-LOAD_MODEL_CKPT_PATH = None  # "logging/checkpoints/final_model/6900.pt"
-START_IT = 4800
+# Set this to the path to load the previous checkpointed model.
+# "logging/checkpoints/final_model_v2/7000.pt"
+LOAD_MODEL_CKPT_PATH = None
+START_IT = 6000
 
 
 @dataclass(frozen=True)
@@ -94,11 +95,11 @@ class HyperParams:
 
 FULL_MODEL_HYPERPARAMS = HyperParams(
     train_cfg=TrainConfig(
-        batch_sz=256,
+        batch_sz=128,
         save_every=300,
         learning_rate=3e-4,
-        eval_freq=100,
-        max_iters=5001,
+        eval_freq=300,
+        max_iters=1_001,
     ),
     transformer_cfg=TransformerConfig(
         block_sz=256,
@@ -126,22 +127,23 @@ TEST_HYPERPARAMS = HyperParams(
         num_blocks=1,
     ),
 )
-HYPERPARAMS = TEST_HYPERPARAMS
+HYPERPARAMS = FULL_MODEL_HYPERPARAMS
 
 #######################################################################################
 #  Main logic function
 #######################################################################################
 
 
-def main(rank, world_size, is_predict_mode):
+def main(rank, world_size, is_predict_mode, use_multigpu):
+    print(use_multigpu)
     tb_writer = setup_tensorboard()
     kwargs = dict(
         is_predict_mode=is_predict_mode,
         device=rank,
         tb_writer=tb_writer,
-        use_multigpu=USE_MULTIGPU,
+        use_multigpu=use_multigpu,
     )
-    if not USE_MULTIGPU:
+    if not use_multigpu:
         gpt_wrapper(**kwargs)
     else:
         try:
@@ -164,7 +166,7 @@ def gpt_wrapper(
     torch.manual_seed(1338)
     train_cfg, transformer_cfg = hyperparams.train_cfg, hyperparams.transformer_cfg
     train_data, val_data, vocab_sz, ixtoc = load_input_file(
-        input_fl=input_fl, train_frac=train_cfg.train_frac
+        input_fl=input_fl, train_frac=train_cfg.train_frac, device=device
     )
     train_dl, val_dl = get_dataloaders(
         train_data=train_data,
@@ -181,11 +183,11 @@ def gpt_wrapper(
         load_model_ckpt_path=load_model_ckpt_path,
         use_multigpu=use_multigpu,
     )
-    tb_writer.add_graph(model, next(iter(train_dl))[0])
-    print("\nExamples before training the model")
+    # tb_writer.add_graph(model, next(iter(train_dl))[0])
+    print(f"\n[GPU {device}]Examples before training the model")
     print_example_kwargs = dict(
         model=model,
-        max_len=10_000 if is_predict_mode else 300,
+        max_len=1_000 if is_predict_mode else 300,
         block_size=transformer_cfg.block_sz,
         ixtoc=ixtoc,
         device=device,
@@ -193,11 +195,11 @@ def gpt_wrapper(
     )
     gpt.print_examples(**print_example_kwargs)  # type: ignore
     if is_predict_mode:
-        print("In prediction mode. Exiting!")
+        print(f"[GPU {device}]In prediction mode. Exiting!")
         return
     optimiser = torch.optim.AdamW(params=model.parameters(), lr=train_cfg.learning_rate)
     # Train the model
-    print("Training the transformer model")
+    print(f"[GPU {device}]Training the transformer model")
     train_model(
         model=model,
         train_dl=train_dl,
@@ -214,10 +216,10 @@ def gpt_wrapper(
         use_multigpu=use_multigpu,
         tb_writer=tb_writer,
     )
-    print("\n\nExamples after training the model")
+    print(f"[GPU {device}]\n\nExamples after training the model")
     gpt.print_examples(**print_example_kwargs)  # type: ignore
     el_time = time.time() - st_time
-    print(f"Time elapsed: {el_time:,}s {el_time//60:,}m")
+    print(f"[GPU {device}]Time elapsed: {el_time:,}s {el_time//60:,}m")
     tb_writer.close()
 
 
@@ -227,7 +229,8 @@ def gpt_wrapper(
 def setup_tensorboard():
     # logging setup
     for folder in ("tb", "checkpoints"):
-        os.makedirs(f"logging/{folder}/{RUN_ID}/")
+        os.makedirs(f"logging/{folder}/{RUN_ID}/", exist_ok=True)
+        print(f"\n\nLogging {folder} at logging/{folder}/{RUN_ID}/\n\n")
     tb_writer = tb.SummaryWriter(log_dir=f"logging/tb/{RUN_ID}")
     print(f"{HYPERPARAMS}")
     return tb_writer
@@ -237,24 +240,24 @@ def setup_ddp(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "45678"
     torch.distributed.init_process_group(
-        backend="gloo", rank=rank, world_size=world_size
+        backend="nccl", rank=rank, world_size=world_size
     )
 
 
 #######################################################################################
 # Load data
 #######################################################################################
-def load_input_file(input_fl, train_frac):
+def load_input_file(input_fl, train_frac, device):
     with open(input_fl, encoding="utf-8") as infile:
         input_txt = infile.read()
     vocab = sorted(set(input_txt))
     vocab_sz = len(vocab)
     ctoix = {char: ix for ix, char in enumerate(vocab)}
     ixtoc = {ix: char for ix, char in enumerate(vocab)}
-    print("Vocab:", vocab)
-    print(f"Num characters: {len(input_txt):,}\nExample text:\n")
+    print(f"[GPU {device}]Vocab:", vocab)
+    print(f"[GPU {device}]Num characters: {len(input_txt):,}\nExample text:\n")
     print(input_txt[:1000])
-    print("-----------------------------------------------------------")
+    print(f"[GPU {device}]-----------------------------------------------------------")
     data = torch.tensor(encode(txt=input_txt, ctoix=ctoix), dtype=torch.long)
     n = int(train_frac * len(data))  # first 90% will be train, rest val
     train_data = data[:n]
@@ -296,7 +299,7 @@ def get_dataloaders(
     use_multigpu: bool,
 ) -> Tuple[data_utils.DataLoader, data_utils.DataLoader]:
     ds_kwargs = dict(block_sz=block_sz, device=device)
-    dl_kwargs = dict(batch_size=batch_sz, pin_memory=True, shuffle=False)
+    dl_kwargs = dict(batch_size=batch_sz, pin_memory=False, shuffle=False)
     train_ds = DecoderDataset(data=train_data, **ds_kwargs)  # type: ignore
     # We want different shards of training data to each gpu and since we are using
     # a sampler we want to turn off shuffle.
@@ -316,16 +319,6 @@ def get_dataloaders(
     return train_dl, val_dl
 
 
-def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_sz, (batch_sz,))
-    x = torch.stack([data[i : i + block_sz] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_sz + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-
 #######################################################################################
 # Training loop
 #######################################################################################
@@ -333,7 +326,7 @@ def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
 
 def build_model(vocab_sz, transformer_cfg, device, load_model_ckpt_path, use_multigpu):
     # Define the model
-    print("Creating the transformer model")
+    print(f"[GPU {device}]Creating the transformer model")
     model = gpt.Transformer(
         embed_dim=transformer_cfg.embed_dim,
         vocab_sz=vocab_sz,
@@ -350,12 +343,12 @@ def build_model(vocab_sz, transformer_cfg, device, load_model_ckpt_path, use_mul
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
     if load_model_ckpt_path is not None:
-        print(f"Loading model from checkpoint: {load_model_ckpt_path}")
+        print(f"[GPU {device}]Loading model from checkpoint: {load_model_ckpt_path}")
         model.load_state_dict(
             torch.load(load_model_ckpt_path, map_location=torch.device("cpu"))
         )
     else:
-        print("No model checkpoint passed. Training from scratch.")
+        print(f"[GPU {device}]No model checkpoint passed. Training from scratch.")
     if use_multigpu:
         # If we are using multiple GPU we are going to make a copy of this model in
         # every gpu.
@@ -386,12 +379,14 @@ def train_model(
     loss_calc_freq=100,
 ):
     prev_val_loss = 1e5
-    for i, (Xi, Yi) in (pbar := tqdm(zip(range(num_iters), train_dl), total=num_iters)):
+    iters = zip(range(num_iters), itertools.cycle(train_dl))
+    for i, (Xi, Yi) in (pbar := tqdm(iters, total=num_iters)):
         loss = eval_model_loss(model=model, X=Xi, Ytrue=Yi)
         model.zero_grad()
         loss.backward()
         optimizer.step()
         # Metric tracking
+        # We want to always compute metrics and checkpoint in the last iteration
         if not ((i == num_iters - 1) or (i % loss_calc_freq == 0)):
             continue
         eval_losses = eval_loss_fn(model=model)
@@ -417,14 +412,13 @@ def train_model(
 
 
 def _checkpoint(model, checkpoint_folder, it, use_multigpu, device):
-    if device in {"cpu", 0}:
+    if device not in {"cpu", 0}:
         # Don't save unless you're CPU or the first GPU.
         # All GPUs possess an identical copy and we don't want each process to
         # save a checkpoint.
         return
     fl = os.path.join(checkpoint_folder, f"{it}.pt")
-    msg = f"Iteration {it}: Checkpointing model at {fl}"
-    print(msg)
+    msg = f"[GPU {device}]Iteration {it}: Checkpointing model at {fl}"
     print(msg)
     state_dict = model.module.state_dict() if use_multigpu else model.state_dict()
     torch.save(state_dict, f=fl)
@@ -492,8 +486,15 @@ def _parse_args():
 
 if __name__ == "__main__":
     is_predict_mode = _parse_args()
-    if USE_MULTIGPU:
+    if USE_MULTIGPU and not is_predict_mode:
         world_size = torch.cuda.device_count()
-        mp.spawn(main, args=(world_size, is_predict_mode), nprocs=world_size)
+        mp.spawn(
+            main, args=(world_size, is_predict_mode, USE_MULTIGPU), nprocs=world_size
+        )
     else:
-        main(world_size=1, rank=DEVICE, is_predict_mode=is_predict_mode)
+        main(
+            world_size=1,
+            rank=DEVICE,
+            is_predict_mode=is_predict_mode,
+            use_multigpu=False,
+        )
