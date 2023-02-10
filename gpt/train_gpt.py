@@ -15,16 +15,31 @@ import time
 import torch
 import torch.nn.functional as F
 import torch.utils.data as data_utils
+
 import torch.utils.tensorboard as tb
 from typing import Dict
 from typing import Tuple
+from dataclasses import dataclass
+from tqdm import tqdm
 
 from torch import nn
 
 import gpt
 
-from dataclasses import dataclass
-from tqdm import tqdm
+#######################################################################################
+# Imports for multi GPU training
+import torch.multiprocessing as mp
+
+# Contains init and destroy process group helpers
+import torch.distributed
+
+# Contains `DistributedSampler``
+import torch.utils.data.distributed
+
+# Contains `DistributedDataParallel` class which does the heavy lifting
+import torch.nn.parallel
+
+#######################################################################################
 
 
 st_time = time.time()
@@ -32,6 +47,8 @@ st_time = time.time()
 #######################################################################################
 # Constants
 #######################################################################################
+USE_MULTIGPU = False
+
 INPUT_FL = "input.txt"
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -46,28 +63,27 @@ START_IT = 4800
 @dataclass(frozen=True)
 class TrainConfig:
 
-    train_frac: float = 0.9
-    batch_sz: int = 32
-    max_iters: int = 5001
-    save_every: int = 300
-    checkpoint_folder: str = f"logging/checkpoints/{RUN_ID}/"
+    batch_sz: int
+    save_every: int
+    learning_rate: float
+    eval_freq: int
+    max_iters: int
     eval_sz: int = 2000
-    eval_freq: int = 100
-    nproc_workers: int = 0
-    learning_rate: float = 3e-4
+    train_frac: float = 0.9
+    checkpoint_folder: str = f"logging/checkpoints/{RUN_ID}/"
 
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    block_sz: int = 8
+    block_sz: int
     # if you update this also update mlp_hidden_dim
-    embed_dim: int = 32
+    embed_dim: int
     # embed_dim * 4
-    mlp_hidden_dim: int = 32 * 4
-    num_attn_heads: int = 2
-    dropout_frac: float = 0.2
+    mlp_hidden_dim: int
+    num_attn_heads: int
+    dropout_frac: float
     # number of decoder transformer blocks stacked one on top of another
-    num_blocks: int = 1
+    num_blocks: int
 
 
 @dataclass(frozen=True)
@@ -76,22 +92,76 @@ class HyperParams:
     train_cfg: TrainConfig
 
 
-HYPERPARAMS = HyperParams(train_cfg=TrainConfig(), transformer_cfg=TransformerConfig())
+FULL_MODEL_HYPERPARAMS = HyperParams(
+    train_cfg=TrainConfig(
+        batch_sz=256,
+        save_every=300,
+        learning_rate=3e-4,
+        eval_freq=100,
+        max_iters=5001,
+    ),
+    transformer_cfg=TransformerConfig(
+        block_sz=256,
+        embed_dim=384,
+        mlp_hidden_dim=384 * 4,
+        num_attn_heads=6,
+        dropout_frac=0.2,
+        num_blocks=6,
+    ),
+)
+TEST_HYPERPARAMS = HyperParams(
+    train_cfg=TrainConfig(
+        batch_sz=32,
+        save_every=10_000,  # don't save
+        learning_rate=1e-3,
+        eval_freq=500,
+        max_iters=6001,
+    ),
+    transformer_cfg=TransformerConfig(
+        block_sz=8,
+        embed_dim=32,
+        mlp_hidden_dim=32 * 4,
+        num_attn_heads=2,
+        dropout_frac=0.2,
+        num_blocks=1,
+    ),
+)
+HYPERPARAMS = TEST_HYPERPARAMS
 
 #######################################################################################
 #  Main logic function
 #######################################################################################
 
 
-def main(
+def main(rank, world_size, is_predict_mode):
+    tb_writer = setup_tensorboard()
+    kwargs = dict(
+        is_predict_mode=is_predict_mode,
+        device=rank,
+        tb_writer=tb_writer,
+        use_multigpu=USE_MULTIGPU,
+    )
+    if not USE_MULTIGPU:
+        gpt_wrapper(**kwargs)
+    else:
+        try:
+            setup_ddp(rank=rank, world_size=world_size)
+            gpt_wrapper(**kwargs)
+        except Exception as e:
+            torch.distributed.destroy_process_group()
+            raise e
+
+
+def gpt_wrapper(
     is_predict_mode,
+    device,
+    tb_writer,
+    use_multigpu,
     input_fl=INPUT_FL,
-    device=DEVICE,
     hyperparams=HYPERPARAMS,
     load_model_ckpt_path=LOAD_MODEL_CKPT_PATH,
 ):
     torch.manual_seed(1338)
-    tb_writer = setup_tensorboard()
     train_cfg, transformer_cfg = hyperparams.train_cfg, hyperparams.transformer_cfg
     train_data, val_data, vocab_sz, ixtoc = load_input_file(
         input_fl=input_fl, train_frac=train_cfg.train_frac
@@ -102,11 +172,15 @@ def main(
         block_sz=transformer_cfg.block_sz,
         batch_sz=train_cfg.batch_sz,
         device=device,
+        use_multigpu=use_multigpu,
     )
     model = build_model(
-        vocab_sz=vocab_sz, transformer_cfg=transformer_cfg, device=device
+        vocab_sz=vocab_sz,
+        transformer_cfg=transformer_cfg,
+        device=device,
+        load_model_ckpt_path=load_model_ckpt_path,
+        use_multigpu=use_multigpu,
     )
-    maybe_load_wts_from_ckpt(model=model, load_model_ckpt_path=load_model_ckpt_path)
     tb_writer.add_graph(model, next(iter(train_dl))[0])
     print("\nExamples before training the model")
     print_example_kwargs = dict(
@@ -135,8 +209,9 @@ def main(
             eval_loss, train_dl=train_dl, val_dl=val_dl, eval_sz=train_cfg.eval_sz
         ),
         save_every=train_cfg.save_every,
-        checkpoint_folder=train_cfg.checkpoint_folder,
         device=device,
+        checkpoint_folder=train_cfg.checkpoint_folder,
+        use_multigpu=use_multigpu,
         tb_writer=tb_writer,
     )
     print("\n\nExamples after training the model")
@@ -149,8 +224,6 @@ def main(
 #######################################################################################
 # SETUP
 #######################################################################################
-
-
 def setup_tensorboard():
     # logging setup
     for folder in ("tb", "checkpoints"):
@@ -158,6 +231,14 @@ def setup_tensorboard():
     tb_writer = tb.SummaryWriter(log_dir=f"logging/tb/{RUN_ID}")
     print(f"{HYPERPARAMS}")
     return tb_writer
+
+
+def setup_ddp(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "45678"
+    torch.distributed.init_process_group(
+        backend="gloo", rank=rank, world_size=world_size
+    )
 
 
 #######################################################################################
@@ -212,12 +293,23 @@ def get_dataloaders(
     block_sz: int,
     batch_sz: int,
     device: str,
+    use_multigpu: bool,
 ) -> Tuple[data_utils.DataLoader, data_utils.DataLoader]:
     ds_kwargs = dict(block_sz=block_sz, device=device)
-    dl_kwargs = dict(batch_size=batch_sz, shuffle=False, sampler=None)
-    train_dl = data_utils.DataLoader(
-        dataset=DecoderDataset(data=train_data, **ds_kwargs), **dl_kwargs  # type: ignore
-    )
+    dl_kwargs = dict(batch_size=batch_sz, pin_memory=True, shuffle=False)
+    train_ds = DecoderDataset(data=train_data, **ds_kwargs)  # type: ignore
+    # We want different shards of training data to each gpu and since we are using
+    # a sampler we want to turn off shuffle.
+    if use_multigpu:
+        train_dl = data_utils.DataLoader(
+            dataset=train_ds,
+            sampler=torch.utils.data.distributed.DistributedSampler(train_ds),
+            **dl_kwargs,
+        )
+    else:
+        train_dl = data_utils.DataLoader(dataset=train_ds, sampler=None, **dl_kwargs)
+    # The GPUs need not get a unique copy of validation data so we don't distributed
+    # sampler here.
     val_dl = data_utils.DataLoader(
         dataset=DecoderDataset(data=val_data, **ds_kwargs), **dl_kwargs  # type: ignore
     )
@@ -239,7 +331,7 @@ def get_batch_helper(split, batch_sz, train_data, val_data, block_sz, device):
 #######################################################################################
 
 
-def build_model(vocab_sz, transformer_cfg, device):
+def build_model(vocab_sz, transformer_cfg, device, load_model_ckpt_path, use_multigpu):
     # Define the model
     print("Creating the transformer model")
     model = gpt.Transformer(
@@ -257,12 +349,6 @@ def build_model(vocab_sz, transformer_cfg, device):
         print(nm, p.shape)
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
-    # model = torch.compile(model=model)
-    return model
-
-
-def maybe_load_wts_from_ckpt(model, load_model_ckpt_path):
-    """Mutates model in-place"""
     if load_model_ckpt_path is not None:
         print(f"Loading model from checkpoint: {load_model_ckpt_path}")
         model.load_state_dict(
@@ -270,6 +356,14 @@ def maybe_load_wts_from_ckpt(model, load_model_ckpt_path):
         )
     else:
         print("No model checkpoint passed. Training from scratch.")
+    if use_multigpu:
+        # If we are using multiple GPU we are going to make a copy of this model in
+        # every gpu.
+        model = torch.nn.parallel.DistributedDataParallel(
+            module=model, device_ids=[device]
+        )
+    # model = torch.compile(model=model)
+    return model
 
 
 #######################################################################################
@@ -286,12 +380,13 @@ def train_model(
     checkpoint_folder,
     save_every,
     device,
+    use_multigpu,
     tb_writer,
     losses: Dict[str, list],  # train -> [], val -> []
     loss_calc_freq=100,
 ):
     prev_val_loss = 1e5
-    for i, (Xi, Yi) in (pbar := tqdm(zip(range(num_iters), train_dl))):
+    for i, (Xi, Yi) in (pbar := tqdm(zip(range(num_iters), train_dl), total=num_iters)):
         loss = eval_model_loss(model=model, X=Xi, Ytrue=Yi)
         model.zero_grad()
         loss.backward()
@@ -312,17 +407,27 @@ def train_model(
             eval_losses["val"] < prev_val_loss
         ):
             _checkpoint(
-                model=model, checkpoint_folder=checkpoint_folder, it=i + START_IT
+                model=model,
+                checkpoint_folder=checkpoint_folder,
+                it=i + START_IT,
+                use_multigpu=use_multigpu,
+                device=device,
             )
         prev_val_loss = eval_losses["val"]
 
 
-def _checkpoint(model, checkpoint_folder, it):
+def _checkpoint(model, checkpoint_folder, it, use_multigpu, device):
+    if device in {"cpu", 0}:
+        # Don't save unless you're CPU or the first GPU.
+        # All GPUs possess an identical copy and we don't want each process to
+        # save a checkpoint.
+        return
     fl = os.path.join(checkpoint_folder, f"{it}.pt")
     msg = f"Iteration {it}: Checkpointing model at {fl}"
     print(msg)
     print(msg)
-    torch.save(model.state_dict(), f=fl)
+    state_dict = model.module.state_dict() if use_multigpu else model.state_dict()
+    torch.save(state_dict, f=fl)
 
 
 @torch.no_grad()
@@ -377,9 +482,18 @@ def calc_split_loss(model, data_splits, split):
 # Boiler plate main function
 #######################################################################################
 
-if __name__ == "__main__":
+
+def _parse_args():
     if len(sys.argv) > 1:
-        is_predict_mode = sys.argv[1].startswith("predict")
+        return sys.argv[1].startswith("predict")
     else:
-        is_predict_mode = False
-    main(is_predict_mode=is_predict_mode)
+        return False
+
+
+if __name__ == "__main__":
+    is_predict_mode = _parse_args()
+    if USE_MULTIGPU:
+        world_size = torch.cuda.device_count()
+        mp.spawn(main, args=(world_size, is_predict_mode), nprocs=world_size)
+    else:
+        main(world_size=1, rank=DEVICE, is_predict_mode=is_predict_mode)
