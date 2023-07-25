@@ -66,7 +66,7 @@ class MultiHeadedAttention(nn.Module):
     decoder layer (B x T x C) and then produces (B x T x (nhead*(out_dim/nhead)))
     output.
 
-    We create nhead attention heads each mapping C -> (out_dim/nhead) space. The
+    We create nhead attention heads each mapping C -> (out_dim/nhead) space.
     """
 
     nhead: int
